@@ -28,9 +28,6 @@ logger.addHandler(file_handler)
 # ---------------------------
 # DISCORD SETUP
 # ---------------------------
-# Plain Client, not commands.Bot - this bot has no slash/prefix commands by design,
-# so there's no need for the command-handling layer (and no on_message/process_commands
-# footgun to worry about as a result).
 intents = discord.Intents.default()
 intents.message_content = True
 
@@ -38,37 +35,46 @@ bot = discord.Client(intents=intents)
 
 state = load_state(STATE_FILE_PATH)
 
-# Fixed display order within each standing message.
-D2R_SLOT_ORDER = ["terror_zone", "dclone"]
-D4_SLOT_ORDER = ["helltide", "legion_event", "world_boss"]
+# Slot order controls display order within each standing message -
+# slower-changing trackers listed first, per your requested layout.
+D2R_SLOT_ORDER = ["dclone", "terror_zone"]
+D4_SLOT_ORDER = ["world_boss", "helltide", "legion_event"]
+
+GROUP_HEADERS = {
+    "d2r": "**Diablo II Resurrected Events**",
+    "d4": "**Diablo IV Events**",
+}
 
 
-def identify_slot(title: str):
+def identify_slot(embed: discord.Embed, author_name: str):
     """
-    Maps an incoming embed title to (group, slot).
-    Matches on stable substrings rather than exact titles, since things like the
-    ladder season name ("Reign of the Warlock") will change over time.
-    Returns (None, None) if the title doesn't match anything we track.
+    Maps an incoming message to (group, slot).
+
+    D4 (Wowhead) embeds carry their own title, so we match on embed.title.
+    D2R (followed-channel) embeds have NO title - the identifying text is
+    the crossposted message's author name instead, so we check that too.
     """
-    t = title.lower()
-    if "#terror-zone" in t:
+    title = (embed.title or "").lower()
+    author = (author_name or "").lower()
+
+    if "#terror-zone" in author or "#terror-zone" in title:
         return "d2r", "terror_zone"
-    if "#dclone-status" in t:
+    if "#dclone-status" in author or "#dclone-status" in title:
         return "d2r", "dclone"
-    if "helltide" in t:
+    if "helltide" in title:
         return "d4", "helltide"
-    if "legion event" in t:
+    if "legion event" in title:
         return "d4", "legion_event"
-    if "world boss" in t:
+    if "world boss" in title:
         return "d4", "world_boss"
     return None, None
 
 
 async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
     """
-    Rebuilds the full embed list for a group (d2r or d4) from stored state and
-    either edits the existing standing message or creates a new one if it's
-    missing (e.g. first run, or someone deleted it manually).
+    Rebuilds the full embed list (plus header text) for a group from stored
+    state and either edits the existing standing message or creates a new
+    one if it's missing.
     """
     slot_order = D2R_SLOT_ORDER if group == "d2r" else D4_SLOT_ORDER
     embeds_dict = state[f"{group}_embeds"]
@@ -81,6 +87,7 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
     if not embeds:
         return  # nothing captured for this group yet
 
+    header = GROUP_HEADERS[group]
     message_id = state.get(f"{group}_message_id")
     message = None
 
@@ -98,9 +105,9 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
 
     try:
         if message:
-            await message.edit(embeds=embeds)
+            await message.edit(content=header, embeds=embeds)
         else:
-            message = await channel.send(embeds=embeds)
+            message = await channel.send(content=header, embeds=embeds)
             state[f"{group}_message_id"] = message.id
             save_state(STATE_FILE_PATH, state)
     except discord.Forbidden:
@@ -127,15 +134,22 @@ async def on_message(message: discord.Message):
         return
 
     embed = message.embeds[0]
-    if not embed.title:
-        return
+    author_name = message.author.name if message.author else ""
 
-    group, slot = identify_slot(embed.title)
+    # Always logged, matched or not - this is what you check in `fly logs`
+    # if a future mismatch happens, instead of guessing from a screenshot.
+    logger.info(
+        "Incoming message - author: %r, embed.title: %r",
+        author_name,
+        embed.title,
+    )
+
+    group, slot = identify_slot(embed, author_name)
     if not group:
-        logger.debug("Ignoring unrecognized embed title: %s", embed.title)
+        logger.info("No match for this message - ignored.")
         return
 
-    logger.info("Update received: %s / %s", group, slot)
+    logger.info("Matched: %s / %s", group, slot)
 
     state[f"{group}_embeds"][slot] = embed.to_dict()
     save_state(STATE_FILE_PATH, state)
@@ -158,8 +172,6 @@ async def on_error(event_name, *args, **kwargs):
 
 def main():
     logger.info("Starting Diablo Event Bot...")
-    # log_handler=None: we've already configured our own handlers above, so this
-    # stops discord.py from also installing its default ones (avoids duplicate log lines).
     bot.run(DISCORD_TOKEN, log_handler=None)
 
 
