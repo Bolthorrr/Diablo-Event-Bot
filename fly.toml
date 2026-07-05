@@ -1,1 +1,15 @@
+app = "diablo-event-bot"
+primary_region = "iad"
 
+[build]
+
+[env]
+  PYTHONUNBUFFERED = "1"
+
+[[mounts]]
+  source = "diablo_bot_data"
+  destination = "/data"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
