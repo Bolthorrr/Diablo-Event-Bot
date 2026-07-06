@@ -124,29 +124,31 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
     embeds = []
     for slot in slot_order:
         data = embeds_dict.get(slot)
-        rebuilt = None
-        if data:
-            try:
-                rebuilt = discord.Embed.from_dict(data)
-            except Exception as exc:
-                # Don't let one bad embed silently kill the whole update - fall
-                # back to a placeholder and log exactly what went wrong so it's
-                # diagnosable instead of the event just quietly disappearing.
-                logger.error(
-                    "Failed to rebuild embed for %s / %s: %s | raw data: %r",
-                    group, slot, exc, data,
-                )
+        placeholder = discord.Embed(
+            title=SLOT_LABELS[slot],
+            description="_Waiting for the next update..._",
+            color=discord.Color.dark_grey(),
+        )
 
-        if rebuilt:
-            embeds.append(rebuilt)
-        else:
-            embeds.append(
-                discord.Embed(
-                    title=SLOT_LABELS[slot],
-                    description="_Waiting for the next update..._",
-                    color=discord.Color.dark_grey(),
-                )
+        # Everything - reconstruction AND the truthiness check right after it -
+        # is now inside this try/except. discord.Embed defines __len__, which
+        # Python uses for truthiness when __bool__ isn't defined, so a plain
+        # "if rebuilt:" check can itself raise for certain embed shapes - and
+        # that was happening OUTSIDE the old try/except, aborting this whole
+        # function silently with nothing logged. This guarantees one embed
+        # (real or placeholder) always gets appended per slot, no matter what.
+        try:
+            if data:
+                rebuilt = discord.Embed.from_dict(data)
+                embeds.append(rebuilt if len(rebuilt) > 0 else placeholder)
+            else:
+                embeds.append(placeholder)
+        except Exception:
+            logger.exception(
+                "Failed to build embed for %s / %s | raw data: %r",
+                group, slot, data,
             )
+            embeds.append(placeholder)
 
 
     header = GROUP_HEADERS[group]
