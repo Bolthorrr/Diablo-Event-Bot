@@ -35,8 +35,6 @@ bot = discord.Client(intents=intents)
 
 state = load_state(STATE_FILE_PATH)
 
-# Slot order controls display order within each standing message -
-# slower-changing trackers listed first, per your requested layout.
 D2R_SLOT_ORDER = ["dclone", "terror_zone"]
 D4_SLOT_ORDER = ["world_boss", "helltide", "legion_event"]
 
@@ -44,6 +42,18 @@ GROUP_HEADERS = {
     "d2r": "**Diablo II Resurrected Events**",
     "d4": "**Diablo IV Events**",
 }
+
+SLOT_LABELS = {
+    "terror_zone": "Terror Zone",
+    "dclone": "Diablo Clone",
+    "helltide": "Helltide",
+    "legion_event": "Legion Event",
+    "world_boss": "World Boss",
+}
+
+# How many recent messages to scan on startup to backfill anything missed
+# while the bot was offline (deploys, crashes, restarts).
+HISTORY_SCAN_LIMIT = 200
 
 
 def identify_slot(embed: discord.Embed, author_name: str):
@@ -70,22 +80,60 @@ def identify_slot(embed: discord.Embed, author_name: str):
     return None, None
 
 
+async def catch_up_on_missed_events(integration_channel: discord.TextChannel) -> None:
+    """
+    Scans recent message history in the integration channel and backfills
+    any slot that's missing from state. Handles the case where a message
+    arrived while the bot was offline (deploy, crash, restart) and would
+    otherwise be permanently missed, since Discord doesn't replay gateway
+    events for time the bot was disconnected.
+    """
+    found = set()
+    all_slots = {("d2r", s) for s in D2R_SLOT_ORDER} | {("d4", s) for s in D4_SLOT_ORDER}
+
+    async for message in integration_channel.history(limit=HISTORY_SCAN_LIMIT):
+        if not message.embeds:
+            continue
+        embed = message.embeds[0]
+        author_name = message.author.name if message.author else ""
+        group, slot = identify_slot(embed, author_name)
+        if not group or (group, slot) in found:
+            continue  # history is newest-first, so first match per slot is the latest
+
+        state[f"{group}_embeds"][slot] = embed.to_dict()
+        found.add((group, slot))
+        logger.info("Catch-up: backfilled %s / %s from channel history", group, slot)
+
+        if found == all_slots:
+            break
+
+    save_state(STATE_FILE_PATH, state)
+
+
 async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
     """
     Rebuilds the full embed list (plus header text) for a group from stored
     state and either edits the existing standing message or creates a new
-    one if it's missing.
+    one if it's missing. Slots with no data yet get a placeholder embed
+    instead of being omitted, so the message always shows the full expected
+    layout.
     """
     slot_order = D2R_SLOT_ORDER if group == "d2r" else D4_SLOT_ORDER
     embeds_dict = state[f"{group}_embeds"]
-    embeds = [
-        discord.Embed.from_dict(embeds_dict[slot])
-        for slot in slot_order
-        if embeds_dict.get(slot)
-    ]
 
-    if not embeds:
-        return  # nothing captured for this group yet
+    embeds = []
+    for slot in slot_order:
+        data = embeds_dict.get(slot)
+        if data:
+            embeds.append(discord.Embed.from_dict(data))
+        else:
+            embeds.append(
+                discord.Embed(
+                    title=SLOT_LABELS[slot],
+                    description="_Waiting for the next update..._",
+                    color=discord.Color.dark_grey(),
+                )
+            )
 
     header = GROUP_HEADERS[group]
     message_id = state.get(f"{group}_message_id")
@@ -125,6 +173,17 @@ async def on_ready():
         TRACKER_CHANNEL_ID,
     )
 
+    integration_channel = bot.get_channel(INTEGRATION_CHANNEL_ID)
+    tracker_channel = bot.get_channel(TRACKER_CHANNEL_ID)
+
+    if integration_channel is None or tracker_channel is None:
+        logger.error("Could not resolve integration/tracker channel - check IDs and permissions.")
+        return
+
+    await catch_up_on_missed_events(integration_channel)
+    await rebuild_and_send(tracker_channel, "d2r")
+    await rebuild_and_send(tracker_channel, "d4")
+
 
 @bot.event
 async def on_message(message: discord.Message):
@@ -136,8 +195,6 @@ async def on_message(message: discord.Message):
     embed = message.embeds[0]
     author_name = message.author.name if message.author else ""
 
-    # Always logged, matched or not - this is what you check in `fly logs`
-    # if a future mismatch happens, instead of guessing from a screenshot.
     logger.info(
         "Incoming message - author: %r, embed.title: %r",
         author_name,
