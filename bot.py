@@ -56,6 +56,21 @@ SLOT_LABELS = {
 HISTORY_SCAN_LIMIT = 200
 
 
+def embed_to_stored_dict(embed: discord.Embed) -> dict:
+    """
+    Converts an embed to a dict for storage, stripping the 'url' field.
+    Wowhead reuses the same url across multiple D4 embeds (e.g. World Boss
+    and Legion Event both point to the same event-timers page) - Discord's
+    client silently merges embeds in one message that share an identical
+    url into a single visual "gallery," dropping the others' visible
+    content. Stripping url avoids that merge; titles just stop being
+    clickable links, which is a fine tradeoff.
+    """
+    data = embed.to_dict()
+    data.pop("url", None)
+    return data
+
+
 def identify_slot(embed: discord.Embed, author_name: str):
     """
     Maps an incoming message to (group, slot).
@@ -100,7 +115,7 @@ async def catch_up_on_missed_events(integration_channel: discord.TextChannel) ->
         if not group or (group, slot) in found:
             continue  # history is newest-first, so first match per slot is the latest
 
-        state[f"{group}_embeds"][slot] = embed.to_dict()
+        state[f"{group}_embeds"][slot] = embed_to_stored_dict(embed)
         found.add((group, slot))
         logger.info("Catch-up: backfilled %s / %s from channel history", group, slot)
 
@@ -233,7 +248,7 @@ async def on_message(message: discord.Message):
 
     logger.info("Matched: %s / %s", group, slot)
 
-    state[f"{group}_embeds"][slot] = embed.to_dict()
+    state[f"{group}_embeds"][slot] = embed_to_stored_dict(embed)
     save_state(STATE_FILE_PATH, state)
 
     tracker_channel = bot.get_channel(TRACKER_CHANNEL_ID)
