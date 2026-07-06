@@ -152,6 +152,15 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
 
 
     header = GROUP_HEADERS[group]
+
+    # Diagnostic: log exactly what we're about to send, so if Discord ever shows
+    # something different than this, we know for certain it's not a bug in how
+    # this list gets built.
+    logger.info(
+        "About to send %s message with %d embeds: %s",
+        group, len(embeds), [e.title for e in embeds],
+    )
+
     message_id = state.get(f"{group}_message_id")
     message = None
 
