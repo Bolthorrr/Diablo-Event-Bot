@@ -124,8 +124,21 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
     embeds = []
     for slot in slot_order:
         data = embeds_dict.get(slot)
+        rebuilt = None
         if data:
-            embeds.append(discord.Embed.from_dict(data))
+            try:
+                rebuilt = discord.Embed.from_dict(data)
+            except Exception as exc:
+                # Don't let one bad embed silently kill the whole update - fall
+                # back to a placeholder and log exactly what went wrong so it's
+                # diagnosable instead of the event just quietly disappearing.
+                logger.error(
+                    "Failed to rebuild embed for %s / %s: %s | raw data: %r",
+                    group, slot, exc, data,
+                )
+
+        if rebuilt:
+            embeds.append(rebuilt)
         else:
             embeds.append(
                 discord.Embed(
@@ -134,6 +147,7 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
                     color=discord.Color.dark_grey(),
                 )
             )
+
 
     header = GROUP_HEADERS[group]
     message_id = state.get(f"{group}_message_id")
