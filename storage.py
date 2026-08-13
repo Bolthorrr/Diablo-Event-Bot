@@ -9,6 +9,9 @@ DEFAULT_STATE = {
     "d4_message_id": None,
     "d2r_embeds": {"terror_zone": None, "dclone": None},
     "d4_embeds": {"helltide": None, "legion_event": None, "world_boss": None},
+    "d2r_last_updated": {"terror_zone": None, "dclone": None},
+    "d4_last_updated": {"helltide": None, "legion_event": None, "world_boss": None},
+    "stale_alerted": [],
 }
 
 
@@ -33,6 +36,8 @@ def load_state(path: str) -> dict:
     merged.update(data)
     merged["d2r_embeds"] = {**merged["d2r_embeds"], **data.get("d2r_embeds", {})}
     merged["d4_embeds"] = {**merged["d4_embeds"], **data.get("d4_embeds", {})}
+    merged["d2r_last_updated"] = {**merged["d2r_last_updated"], **data.get("d2r_last_updated", {})}
+    merged["d4_last_updated"] = {**merged["d4_last_updated"], **data.get("d4_last_updated", {})}
     return merged
 
 
