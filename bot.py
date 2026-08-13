@@ -1,10 +1,18 @@
 import logging
 import logging.handlers
 import os
+from datetime import datetime, timedelta, timezone
 
 import discord
+from discord.ext import tasks
 
-from config import DISCORD_TOKEN, INTEGRATION_CHANNEL_ID, TRACKER_CHANNEL_ID, STATE_FILE_PATH
+from config import (
+    DISCORD_TOKEN,
+    INTEGRATION_CHANNEL_ID,
+    TRACKER_CHANNEL_ID,
+    ALERT_CHANNEL_ID,
+    STATE_FILE_PATH,
+)
 from storage import load_state, save_state
 
 # ---------------------------
@@ -54,6 +62,22 @@ SLOT_LABELS = {
 # How many recent messages to scan on startup to backfill anything missed
 # while the bot was offline (deploys, crashes, restarts).
 HISTORY_SCAN_LIMIT = 200
+
+# If a slot hasn't updated within this long, something upstream (the source
+# webhook/follow) is likely broken - alert instead of waiting for someone to
+# notice a stale channel by eye. Roughly 3x each tracker's normal cadence.
+STALE_THRESHOLDS = {
+    "d4": {
+        "helltide": timedelta(hours=3),
+        "legion_event": timedelta(hours=1, minutes=30),
+        "world_boss": timedelta(hours=10),
+    },
+    "d2r": {
+        "terror_zone": timedelta(hours=3),
+        "dclone": timedelta(hours=8),
+    },
+}
+STALENESS_CHECK_INTERVAL_MINUTES = 30
 
 
 def embed_to_stored_dict(embed: discord.Embed) -> dict:
@@ -116,6 +140,7 @@ async def catch_up_on_missed_events(integration_channel: discord.TextChannel) ->
             continue  # history is newest-first, so first match per slot is the latest
 
         state[f"{group}_embeds"][slot] = embed_to_stored_dict(embed)
+        state[f"{group}_last_updated"][slot] = datetime.now(timezone.utc).isoformat()
         found.add((group, slot))
         logger.info("Catch-up: backfilled %s / %s from channel history", group, slot)
 
@@ -204,6 +229,53 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
         logger.error("Discord API error sending/editing standing message for %s: %s", group, exc)
 
 
+@tasks.loop(minutes=STALENESS_CHECK_INTERVAL_MINUTES)
+async def check_staleness():
+    """
+    Compares each tracker's last-updated time against its expected cadence.
+    If something's gone quiet for way longer than normal, that's a strong
+    signal the upstream source (Wowhead's webhook, the D2R followed channel)
+    has broken - post one alert per stale episode instead of spamming, and
+    clear it automatically once fresh data comes back in.
+    """
+    alert_channel = bot.get_channel(ALERT_CHANNEL_ID)
+    if alert_channel is None:
+        logger.error("Alert channel %s not found - check ALERT_CHANNEL_ID and permissions.", ALERT_CHANNEL_ID)
+        return
+
+    now = datetime.now(timezone.utc)
+    alerted = set(state.get("stale_alerted", []))
+    changed = False
+
+    for group, thresholds in STALE_THRESHOLDS.items():
+        for slot, threshold in thresholds.items():
+            key = f"{group}/{slot}"
+            last_str = state.get(f"{group}_last_updated", {}).get(slot)
+            if not last_str:
+                continue  # never received data for this slot yet - nothing to compare
+
+            last_dt = datetime.fromisoformat(last_str)
+            age = now - last_dt
+
+            if age > threshold and key not in alerted:
+                await alert_channel.send(
+                    f"⚠️ **{SLOT_LABELS[slot]}** ({group.upper()}) hasn't updated in "
+                    f"{age.days}d {age.seconds // 3600}h - the source webhook/feed may be down. "
+                    f"Check `#event-integration`."
+                )
+                alerted.add(key)
+                changed = True
+                logger.warning("Staleness alert sent for %s (age: %s)", key, age)
+            elif age <= threshold and key in alerted:
+                alerted.discard(key)
+                changed = True
+                logger.info("Staleness cleared for %s - fresh data received.", key)
+
+    if changed:
+        state["stale_alerted"] = list(alerted)
+        save_state(STATE_FILE_PATH, state)
+
+
 @bot.event
 async def on_ready():
     logger.info("Logged in as %s (id: %s)", bot.user, bot.user.id)
@@ -223,6 +295,9 @@ async def on_ready():
     await catch_up_on_missed_events(integration_channel)
     await rebuild_and_send(tracker_channel, "d2r")
     await rebuild_and_send(tracker_channel, "d4")
+
+    if not check_staleness.is_running():
+        check_staleness.start()
 
 
 @bot.event
@@ -249,6 +324,7 @@ async def on_message(message: discord.Message):
     logger.info("Matched: %s / %s", group, slot)
 
     state[f"{group}_embeds"][slot] = embed_to_stored_dict(embed)
+    state[f"{group}_last_updated"][slot] = datetime.now(timezone.utc).isoformat()
     save_state(STATE_FILE_PATH, state)
 
     tracker_channel = bot.get_channel(TRACKER_CHANNEL_ID)
