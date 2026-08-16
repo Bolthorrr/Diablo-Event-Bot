@@ -238,6 +238,8 @@ async def check_staleness():
     has broken - post one alert per stale episode instead of spamming, and
     clear it automatically once fresh data comes back in.
     """
+    logger.info("Running staleness check...")
+
     alert_channel = bot.get_channel(ALERT_CHANNEL_ID)
     if alert_channel is None:
         logger.error("Alert channel %s not found - check ALERT_CHANNEL_ID and permissions.", ALERT_CHANNEL_ID)
@@ -252,10 +254,12 @@ async def check_staleness():
             key = f"{group}/{slot}"
             last_str = state.get(f"{group}_last_updated", {}).get(slot)
             if not last_str:
+                logger.info("Staleness check: %s has no data yet - skipping.", key)
                 continue  # never received data for this slot yet - nothing to compare
 
             last_dt = datetime.fromisoformat(last_str)
             age = now - last_dt
+            logger.info("Staleness check: %s last updated %s ago (threshold %s)", key, age, threshold)
 
             if age > threshold and key not in alerted:
                 await alert_channel.send(
@@ -274,6 +278,17 @@ async def check_staleness():
     if changed:
         state["stale_alerted"] = list(alerted)
         save_state(STATE_FILE_PATH, state)
+
+
+@check_staleness.error
+async def check_staleness_error(error: Exception):
+    # tasks.loop silently stops forever on an unhandled exception with no
+    # log anywhere by default - this is what would have been hiding a bug
+    # like that. Log it in full, then restart the loop so a single bad tick
+    # doesn't permanently kill monitoring.
+    logger.exception("check_staleness task crashed: %s", error)
+    if not check_staleness.is_running():
+        check_staleness.restart()
 
 
 @bot.event
@@ -298,6 +313,9 @@ async def on_ready():
 
     if not check_staleness.is_running():
         check_staleness.start()
+        logger.info("Staleness watchdog started (checks every %d min).", STALENESS_CHECK_INTERVAL_MINUTES)
+    else:
+        logger.info("Staleness watchdog already running.")
 
 
 @bot.event
