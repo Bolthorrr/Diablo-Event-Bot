@@ -74,10 +74,17 @@ STALE_THRESHOLDS = {
     },
     "d2r": {
         "terror_zone": timedelta(hours=3),
-        "dclone": timedelta(hours=8),
+        "dclone": timedelta(days=7),
     },
 }
 STALENESS_CHECK_INTERVAL_MINUTES = 30
+
+# Once an episode has been alerted, re-send a reminder every this-often while
+# it's STILL stale, instead of going silent forever after the first alert.
+# Without this, a source that never recovers (e.g. a webhook you removed and
+# didn't replace) only ever pages once, then never again - which is exactly
+# what happened to the D4 alerts.
+STALE_REMINDER_INTERVAL = timedelta(days=1)
 
 
 def embed_to_stored_dict(embed: discord.Embed) -> dict:
@@ -235,8 +242,10 @@ async def check_staleness():
     Compares each tracker's last-updated time against its expected cadence.
     If something's gone quiet for way longer than normal, that's a strong
     signal the upstream source (Wowhead's webhook, the D2R followed channel)
-    has broken - post one alert per stale episode instead of spamming, and
-    clear it automatically once fresh data comes back in.
+    has broken - post an alert, then a reminder every STALE_REMINDER_INTERVAL
+    for as long as it's still stale (instead of alerting once and going
+    permanently silent), and clear it automatically once fresh data
+    comes back in.
     """
     logger.info("Running staleness check...")
 
@@ -246,7 +255,15 @@ async def check_staleness():
         return
 
     now = datetime.now(timezone.utc)
-    alerted = set(state.get("stale_alerted", []))
+    # alerted: key -> ISO timestamp of the last alert sent for that episode.
+    # (Migrates transparently from the old list-of-keys format, where every
+    # existing entry is treated as "alerted just now" so reminders start
+    # counting fresh instead of firing immediately on the next check.)
+    raw_alerted = state.get("stale_alerted", {})
+    if isinstance(raw_alerted, list):
+        alerted = {key: now.isoformat() for key in raw_alerted}
+    else:
+        alerted = dict(raw_alerted)
     changed = False
 
     for group, thresholds in STALE_THRESHOLDS.items():
@@ -261,22 +278,29 @@ async def check_staleness():
             age = now - last_dt
             logger.info("Staleness check: %s last updated %s ago (threshold %s)", key, age, threshold)
 
-            if age > threshold and key not in alerted:
-                await alert_channel.send(
-                    f"⚠️ **{SLOT_LABELS[slot]}** ({group.upper()}) hasn't updated in "
-                    f"{age.days}d {age.seconds // 3600}h - the source webhook/feed may be down. "
-                    f"Check `#event-integration`."
+            if age > threshold:
+                last_alert_str = alerted.get(key)
+                due = (
+                    last_alert_str is None
+                    or (now - datetime.fromisoformat(last_alert_str)) >= STALE_REMINDER_INTERVAL
                 )
-                alerted.add(key)
-                changed = True
-                logger.warning("Staleness alert sent for %s (age: %s)", key, age)
-            elif age <= threshold and key in alerted:
-                alerted.discard(key)
+                if due:
+                    verb = "still hasn't" if last_alert_str else "hasn't"
+                    await alert_channel.send(
+                        f"⚠️ **{SLOT_LABELS[slot]}** ({group.upper()}) {verb} updated in "
+                        f"{age.days}d {age.seconds // 3600}h - the source webhook/feed may be down. "
+                        f"Check `#event-integration`."
+                    )
+                    alerted[key] = now.isoformat()
+                    changed = True
+                    logger.warning("Staleness alert sent for %s (age: %s)", key, age)
+            elif key in alerted:
+                del alerted[key]
                 changed = True
                 logger.info("Staleness cleared for %s - fresh data received.", key)
 
     if changed:
-        state["stale_alerted"] = list(alerted)
+        state["stale_alerted"] = alerted
         save_state(STATE_FILE_PATH, state)
 
 
