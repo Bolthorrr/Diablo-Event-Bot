@@ -3,7 +3,6 @@ import logging.handlers
 import os
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
 import discord
 from discord.ext import tasks
 
@@ -67,21 +66,19 @@ HISTORY_SCAN_LIMIT = 200
 # If a slot hasn't updated within this long, something upstream is likely
 # broken - alert instead of waiting for someone to notice by eye.
 #
-# D4 slots changed meaning: they used to mean "a new event was reported via
-# Wowhead's webhook" (so thresholds were ~3x each event's real-world
-# cadence). Wowhead discontinued that webhook, so D4 now comes from polling
-# diablo4.life's API directly (see poll_d4_api below) every
-# D4_POLL_INTERVAL_MINUTES. A D4 slot's last_updated now means "last time we
-# successfully reached that API," regardless of whether an event happened to
-# be active - so the threshold here is really "how long can the API be
-# unreachable before that's worth a page," not "how long since this event
-# last fired." 30 minutes = 15 missed polls in a row, generous enough to
-# ride out a brief redeploy or network blip without false alarms.
+# D4 events are sourced the same way D2R always has been: Discord's "Follow
+# Channel" crossposting another server's announcement channel into our
+# #event-integration. Wowhead's old webhook died (see identify_slot); D4 is
+# now fed by following Helltides.com's own helltide-alerts/legion-alerts/
+# worldboss-alerts channels instead, so these thresholds mean the same thing
+# they always did for D2R: "how long since a real event update came through,"
+# set generously above each event's real-world cadence (Legion ~25-30 min,
+# Helltide ~1-2h between state-change posts, World Boss ~3.5-4h).
 STALE_THRESHOLDS = {
     "d4": {
-        "helltide": timedelta(minutes=30),
-        "legion_event": timedelta(minutes=30),
-        "world_boss": timedelta(minutes=30),
+        "helltide": timedelta(hours=3),
+        "legion_event": timedelta(hours=1, minutes=30),
+        "world_boss": timedelta(hours=10),
     },
     "d2r": {
         "terror_zone": timedelta(hours=3),
@@ -89,12 +86,6 @@ STALE_THRESHOLDS = {
     },
 }
 STALENESS_CHECK_INTERVAL_MINUTES = 30
-
-# How often to poll diablo4.life's public tracker API for D4 events.
-# Legion Events are the shortest-lived (~25 min cycle), so this stays well
-# under that to avoid missing one entirely between polls.
-D4_POLL_INTERVAL_MINUTES = 2
-D4_API_URL = "https://diablo4.life/api/trackers/list"
 
 # Once an episode has been alerted, re-send a reminder every this-often while
 # it's STILL stale, instead of going silent forever after the first alert.
@@ -123,14 +114,15 @@ def identify_slot(embed: discord.Embed, author_name: str):
     """
     Maps an incoming channel message to (group, slot).
 
-    Only D2R (followed-channel) events arrive this way anymore. D2R embeds
-    have NO title - the identifying text is the crossposted message's
-    author name instead, so we check that.
+    D2R embeds have NO title - the identifying text is the crossposted
+    message's author name instead (the followed server/channel label), so
+    we check that.
 
-    D4 events used to arrive here too, via a Wowhead webhook that posted
-    titled embeds into #event-integration - Wowhead discontinued that
-    integration, so D4 is now sourced by polling an API directly instead
-    (see poll_d4_api). Nothing posts D4 embeds into this channel anymore.
+    D4 events are matched on embed title instead, since Helltides.com's
+    alert embeds always have one (e.g. "Helltide Active", "Legion Starting
+    Soon", "World Boss Spawning Soon") and the title text stays stable
+    across whatever state the event is in (starting/active/ending), so a
+    simple substring check is robust to wording changes on their end.
     """
     title = (embed.title or "").lower()
     author = (author_name or "").lower()
@@ -139,6 +131,12 @@ def identify_slot(embed: discord.Embed, author_name: str):
         return "d2r", "terror_zone"
     if "#dclone-status" in author or "#dclone-status" in title:
         return "d2r", "dclone"
+    if "helltide" in title:
+        return "d4", "helltide"
+    if "legion" in title:
+        return "d4", "legion_event"
+    if "world boss" in title:
+        return "d4", "world_boss"
     return None, None
 
 
@@ -151,9 +149,7 @@ async def catch_up_on_missed_events(integration_channel: discord.TextChannel) ->
     events for time the bot was disconnected.
     """
     found = set()
-    # D4 is no longer sourced from this channel (see identify_slot) - only
-    # D2R slots can still be backfilled from message history.
-    all_slots = {("d2r", s) for s in D2R_SLOT_ORDER}
+    all_slots = {("d2r", s) for s in D2R_SLOT_ORDER} | {("d4", s) for s in D4_SLOT_ORDER}
 
     async for message in integration_channel.history(limit=HISTORY_SCAN_LIMIT):
         if not message.embeds:
@@ -254,97 +250,6 @@ async def rebuild_and_send(channel: discord.TextChannel, group: str) -> None:
         logger.error("Discord API error sending/editing standing message for %s: %s", group, exc)
 
 
-def _discord_relative_timestamp(epoch_ms) -> str:
-    """Converts a millisecond epoch timestamp to Discord's auto-formatting
-    relative-time tag, e.g. <t:1234567890:R> renders as 'in 12 minutes' or
-    '2 hours ago', and updates live in the Discord client with no bot
-    involvement."""
-    try:
-        return f"<t:{int(epoch_ms) // 1000}:R>"
-    except (TypeError, ValueError):
-        return "unknown"
-
-
-def build_d4_embed(label: str, payload: dict | None) -> discord.Embed:
-    """
-    Builds a display embed for one D4 slot from the diablo4.life tracker
-    API response. The API returns {} for a slot with nothing currently
-    active/scheduled - that's valid, successful data, not a failure (see
-    poll_d4_api for why that still counts as "fresh" for staleness).
-    """
-    if not payload:
-        return discord.Embed(
-            title=label,
-            description="_No active or upcoming event reported right now._",
-            color=discord.Color.dark_grey(),
-        )
-
-    lines = []
-    name = payload.get("name")
-    time_ms = payload.get("time")
-    if name:
-        lines.append(f"**{name}**")
-    if time_ms:
-        lines.append(f"Spawns {_discord_relative_timestamp(time_ms)}")
-    if not lines:
-        # Unrecognized shape from the API - surface it in Discord so it's
-        # debuggable without needing to go dig through flyctl logs.
-        lines.append(f"_Unrecognized API data: {payload}_")
-
-    return discord.Embed(title=label, description="\n".join(lines), color=discord.Color.red())
-
-
-async def poll_d4_api() -> bool:
-    """
-    Fetches current D4 event data from diablo4.life's public tracker API
-    and updates state for all three D4 slots. Returns True on success.
-
-    This replaces the old Wowhead-webhook-via-Discord ingestion for D4
-    events, which stopped working once Wowhead discontinued that
-    integration. This API needs no key/login and is polled directly, so
-    D4 tracking no longer depends on any third party continuing to post
-    into this Discord server on our behalf.
-    """
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(D4_API_URL, timeout=aiohttp.ClientTimeout(total=15)) as resp:
-                resp.raise_for_status()
-                data = await resp.json(content_type=None)
-    except Exception as exc:
-        logger.error("D4 API poll failed: %s", exc)
-        return False
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    mapping = {
-        "helltide": data.get("helltide"),
-        "world_boss": data.get("worldBoss") or data.get("nextWorldBoss"),
-        "legion_event": data.get("zoneEvent"),
-    }
-
-    for slot, payload in mapping.items():
-        state["d4_embeds"][slot] = embed_to_stored_dict(build_d4_embed(SLOT_LABELS[slot], payload))
-        state["d4_last_updated"][slot] = now_iso
-
-    save_state(STATE_FILE_PATH, state)
-    logger.info("D4 API poll succeeded.")
-    return True
-
-
-@tasks.loop(minutes=D4_POLL_INTERVAL_MINUTES)
-async def poll_d4_api_loop():
-    if await poll_d4_api():
-        tracker_channel = bot.get_channel(TRACKER_CHANNEL_ID)
-        if tracker_channel is not None:
-            await rebuild_and_send(tracker_channel, "d4")
-
-
-@poll_d4_api_loop.error
-async def poll_d4_api_loop_error(error: Exception):
-    logger.exception("poll_d4_api_loop task crashed: %s", error)
-    if not poll_d4_api_loop.is_running():
-        poll_d4_api_loop.restart()
-
-
 @tasks.loop(minutes=STALENESS_CHECK_INTERVAL_MINUTES)
 async def check_staleness():
     """
@@ -442,11 +347,6 @@ async def on_ready():
 
     await catch_up_on_missed_events(integration_channel)
     await rebuild_and_send(tracker_channel, "d2r")
-
-    # Immediate first D4 fetch so the tracker isn't blank/stale-looking
-    # until the first poll_d4_api_loop tick (up to D4_POLL_INTERVAL_MINUTES
-    # away otherwise).
-    await poll_d4_api()
     await rebuild_and_send(tracker_channel, "d4")
 
     if not check_staleness.is_running():
@@ -454,12 +354,6 @@ async def on_ready():
         logger.info("Staleness watchdog started (checks every %d min).", STALENESS_CHECK_INTERVAL_MINUTES)
     else:
         logger.info("Staleness watchdog already running.")
-
-    if not poll_d4_api_loop.is_running():
-        poll_d4_api_loop.start()
-        logger.info("D4 API poller started (every %d min).", D4_POLL_INTERVAL_MINUTES)
-    else:
-        logger.info("D4 API poller already running.")
 
 
 @bot.event
